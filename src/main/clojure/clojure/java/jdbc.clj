@@ -215,15 +215,38 @@ generated keys are returned (as a map)." }
    the rows in the java.sql.ResultSet rs. Based on clojure.core/resultset-seq
    but it respects the current naming strategy. Duplicate column names are
    made unique by appending _N before applying the naming strategy (where
-   N is a unique integer)."
-  [^ResultSet rs]
+   N is a unique integer).
+   optional parameter:
+     :tz-columns map of column-names to [column-type timezone]
+                 eg. {:dob [:date \"UTC\"]
+                      :entry_time [:time \"Asia/Singapore\"]}  "
+  [^ResultSet rs & {:keys [tz-columns]}]
     (let [rsmeta (.getMetaData rs)
           idxs (range 1 (inc (.getColumnCount rsmeta)))
-          keys (->> idxs
-                 (map (fn [^Integer i] (.getColumnLabel rsmeta i)))
-                 make-cols-unique
-                 (map (comp keyword *as-key*)))
-          row-values (fn [] (map (fn [^Integer i] (.getObject rs i)) idxs))
+          key-idxs (->> idxs
+                     (map (fn [^Integer i] (.getColumnLabel rsmeta i)))
+                     make-cols-unique
+                     (map (comp keyword *as-key*))
+                     (map #(vec [%2 %1]) idxs))
+          tz-column-names (for [[column-name _] tz-columns] column-name)
+          key-idxs-with-tz (filter #(contains? (into #{} tz-column-names) (first %)) key-idxs)
+          key-idxs-without-tz (remove #(contains? (into #{} tz-column-names) (first %)) key-idxs)
+          tz-to-calendar (reduce (fn [tz-to-calendar ^String tz] 
+                                   (assoc tz-to-calendar tz (java.util.GregorianCalendar. 
+                                                 (java.util.TimeZone/getTimeZone tz))))
+                                 {}
+                                 (distinct (for [[_ [_ tz]] tz-columns] tz)))
+          
+          row-values (fn [] (concat 
+                              (map (fn [[_ ^Integer i]] (.getObject rs i)) key-idxs-without-tz)
+                              (map (fn [[^String column-name ^Integer i]]
+                                     (let [column-type (first (tz-columns column-name))
+                                           ^String column-tz (second (tz-columns column-name))]
+                                       (case column-type
+                                         :timestamp (.getTimestamp rs i (tz-to-calendar column-tz))
+                                         :date (.getDate rs i (tz-to-calendar column-tz))
+                                         :time (.getTime rs i (tz-to-calendar column-tz)))))
+                                   key-idxs-with-tz)))
           ;; This used to use create-struct (on keys) and then struct to populate each row.
           ;; That had the side effect of preserving the order of columns in each row. As
           ;; part of JDBC-15, this was changed because structmaps are deprecated. We don't
@@ -233,7 +256,9 @@ generated keys are returned (as a map)." }
           ;; on the order-preserving behavior of structmaps, we can reconsider...
           rows (fn thisfn []
                  (when (.next rs)
-                   (cons (zipmap keys (row-values)) (lazy-seq (thisfn)))))]
+                   (cons (zipmap (map first (concat key-idxs-without-tz key-idxs-with-tz))
+                                 (row-values))
+                         (lazy-seq (thisfn)))))]
       (rows)))
 
 (defn as-quoted-str
@@ -666,11 +691,11 @@ generated keys are returned (as a map)." }
         params (vec (cond sql-is-first (rest sql-params)
                           options-are-first (rest (rest sql-params))
                           :else (rest sql-params)))
-        prepare-args (when (map? special) (flatten (seq special)))]
-    (with-open [^PreparedStatement stmt (if (instance? PreparedStatement special) special (apply prepare-statement (connection) sql prepare-args))]
+        options (when (map? special) (flatten (seq special)))]
+    (with-open [^PreparedStatement stmt (if (instance? PreparedStatement special) special (apply prepare-statement (connection) sql options))]
       (set-parameters stmt params)
       (with-open [rset (.executeQuery stmt)]
-        (func (resultset-seq rset))))))
+        (func (apply resultset-seq rset options))))))
 
 (defmacro with-query-results
   "Executes a query, then evaluates body with results bound to a seq of the
